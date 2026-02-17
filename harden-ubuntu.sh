@@ -12,17 +12,15 @@ NC='\033[0m'
 
 echo -e "${GREEN}=== Безопасная настройка сервера (SSH-ключ, BBR, fail2ban) ===${NC}"
 
-# Проверка root
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}Запустите скрипт от root (sudo)${NC}"
     exit 1
 fi
 
-# Защита от запуска через пайп (curl | bash)
 if ! test -t 0; then
     echo -e "${RED}Этот скрипт требует интерактивного ввода.${NC}"
-    echo "Рекомендуемый способ запуска:"
-    echo "  curl -fsSL https://raw.githubusercontent.com/kabebon/harden-ubuntu.sh/main/harden-ubuntu.sh -o harden.sh"
+    echo "Рекомендуемый способ:"
+    echo "  curl -fsSL https://raw.githubusercontent.com/.../harden-ubuntu.sh -o harden.sh"
     echo "  chmod +x harden.sh"
     echo "  sudo ./harden.sh"
     exit 1
@@ -38,39 +36,26 @@ KEY_DIR=""
 
 echo "Лог отката будет сохранён в: $ROLLBACK_LOG" | tee -a "$ROLLBACK_LOG"
 
-# ────────────────────────────────────────────────
-# Функция отката
-# ────────────────────────────────────────────────
 rollback() {
-    echo -e "\n${RED}Прерывание или ошибка → запускаем откат${NC}" | tee -a "$ROLLBACK_LOG"
-    echo "Время: $(date)" | tee -a "$ROLLBACK_LOG"
+    echo -e "\n${RED}Прерывание или ошибка → откат${NC}" | tee -a "$ROLLBACK_LOG"
 
-    # Удаление временных ключей
-    if [ -n "$KEY_DIR" ] && [ -d "$KEY_DIR" ]; then
-        rm -rf "$KEY_DIR" 2>/dev/null
-        echo "→ Временные ключи удалены" | tee -a "$ROLLBACK_LOG"
-    fi
+    [ -n "$KEY_DIR" ] && [ -d "$KEY_DIR" ] && rm -rf "$KEY_DIR" && echo "→ Ключи удалены" | tee -a "$ROLLBACK_LOG"
 
-    # Восстановление sshd_config
-    if [ -n "$SSHD_BACKUP" ] && [ -f "$SSHD_BACKUP" ]; then
-        cp "$SSHD_BACKUP" /etc/ssh/sshd_config 2>/dev/null
-        systemctl restart ssh || systemctl restart sshd 2>/dev/null
+    [ -n "$SSHD_BACKUP" ] && [ -f "$SSHD_BACKUP" ] && \
+        cp "$SSHD_BACKUP" /etc/ssh/sshd_config && \
+        systemctl restart ssh || systemctl restart sshd && \
         echo "→ sshd_config восстановлен" | tee -a "$ROLLBACK_LOG"
-    fi
 
-    # Удаление пользователя и sudoers (только если создавали)
     if $USER_CREATED && id "$NEW_USER" &>/dev/null; then
         deluser --remove-home "$NEW_USER" 2>/dev/null
         [ -n "$SUDOERS_FILE" ] && rm -f "$SUDOERS_FILE" 2>/dev/null
         echo "→ Пользователь $NEW_USER и sudoers удалены" | tee -a "$ROLLBACK_LOG"
     fi
 
-    # UFW — откатываем ТОЛЬКО если был выключен до скрипта
     if $UFW_WAS_ENABLED; then
-        ufw --force disable 2>/dev/null && \
-            echo "→ UFW отключён (был выключен до запуска)" | tee -a "$ROLLBACK_LOG"
+        ufw --force disable 2>/dev/null && echo "→ UFW отключён (был выключен до запуска)" | tee -a "$ROLLBACK_LOG"
     else
-        echo "→ UFW уже был включён → откат UFW пропущен (новые allow-правила остались)" | tee -a "$ROLLBACK_LOG"
+        echo "→ UFW уже был включён → откат UFW пропущен" | tee -a "$ROLLBACK_LOG"
     fi
 
     echo -e "${YELLOW}Откат завершён (частично). Проверьте систему вручную!${NC}" | tee -a "$ROLLBACK_LOG"
@@ -118,9 +103,9 @@ if [ "$NEW_PORT" = "22" ]; then
 fi
 
 # ────────────────────────────────────────────────
-# Генерация ключей
+# Генерация и красивый вывод ключей
 # ────────────────────────────────────────────────
-echo -e "\n${GREEN}Генерируем пару ed25519 ключей...${NC}"
+echo -e "\n${GREEN}Генерируем пару ed25519 ключей...${NC}\n"
 
 KEY_DIR="/root/temp-ssh-key-$(date +%s)"
 mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
@@ -130,27 +115,32 @@ ssh-keygen -t ed25519 -f "$KEY_DIR/id_ed25519" -N "" -C "$NEW_USER@$(hostname)-$
 PUB_KEY=$(cat "$KEY_DIR/id_ed25519.pub")
 PRIV_KEY=$(cat "$KEY_DIR/id_ed25519")
 
-echo -e "\n${YELLOW}┌───────────────────────────── ВАЖНО ─────────────────────────────┐${NC}"
+echo -e "${YELLOW}┌───────────────────────────────────────────────────────────────┐${NC}"
+echo -e "${YELLOW}│                     ВАЖНО! СДЕЛАЙТЕ ЭТО СЕЙЧАС                 │${NC}"
 echo -e "${YELLOW}│  Скопируйте приватный ключ ниже — он исчезнет после выполнения!  │${NC}"
-echo -e "${YELLOW}└───────────────────────────────────────────────────────────────────┘${NC}\n"
+echo -e "${YELLOW}└───────────────────────────────────────────────────────────────┘${NC}\n"
 
+echo -e "${YELLOW}Приватный ключ:${NC}"
+echo ""
 echo "$PRIV_KEY"
+echo ""
 
-echo -e "\n${GREEN}Публичный ключ (будет добавлен):${NC}"
+echo -e "${GREEN}Публичный ключ (будет добавлен):${NC}"
 echo "$PUB_KEY"
+echo ""
 
 read -r -p $'\n'"${RED}Скопировали приватный ключ в безопасное место? Напишите yes: ${NC}" confirm
-[[ "$confirm" == "yes" ]] || { echo "Не подтверждено → выход"; rollback; }
+[[ "$confirm" == "yes" ]] || { echo -e "${RED}Не подтверждено → выход${NC}"; rm -rf "$KEY_DIR"; exit 1; }
+
+echo -e "${GREEN}Подтверждение получено. Продолжаем...${NC}\n"
 
 # ────────────────────────────────────────────────
-# Опасные изменения — начинаем откат при ошибке
+# Опасная часть
 # ────────────────────────────────────────────────
 
-# Бэкап sshd_config
 SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
 cp /etc/ssh/sshd_config "$SSHD_BACKUP" 2>/dev/null
 
-# Пользователь + sudo + ключ
 if $USER_CREATED; then
     adduser --disabled-password --gecos "" "$NEW_USER"
     usermod -aG sudo "$NEW_USER"
@@ -165,12 +155,10 @@ chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.ssh"
 chmod 700 "/home/$NEW_USER/.ssh"
 chmod 600 "/home/$NEW_USER/.ssh/authorized_keys"
 
-# SSH конфиг
 sed -i "s/^#*Port.*/Port $NEW_PORT/" /etc/ssh/sshd_config
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 
-# UFW состояние
 if ufw status | grep -q "Status: inactive"; then
     UFW_WAS_ENABLED=true
 fi
@@ -181,7 +169,7 @@ ufw allow 443/tcp          2>/dev/null || true
 ufw --force enable         2>/dev/null || true
 
 # BBR
-echo -e "\n${YELLOW}Настройка BBR...${NC}"
+echo -e "${YELLOW}Настройка BBR...${NC}"
 if sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr; then
     if ! sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
@@ -196,7 +184,7 @@ else
 fi
 
 # fail2ban
-echo -e "\n${YELLOW}Установка fail2ban...${NC}"
+echo -e "${YELLOW}Установка fail2ban...${NC}"
 apt update -qq && apt install -y fail2ban
 
 cat <<EOT > /etc/fail2ban/jail.local
@@ -225,7 +213,7 @@ if ! systemctl is-active --quiet "$SSH_SVC"; then
 fi
 
 # ────────────────────────────────────────────────
-# Успешное завершение
+# Финал
 # ────────────────────────────────────────────────
 
 echo -e "\n${GREEN}============================================================${NC}"
@@ -243,7 +231,6 @@ echo -e "${YELLOW}ОБЯЗАТЕЛЬНО проверьте вход в НОВО
 echo -e "перед закрытием текущей сессии root!"
 echo -e "${GREEN}============================================================${NC}"
 
-# Уборка
 rm -rf "$KEY_DIR"
 
 echo -e "\nУдачи и безопасной работы!${NC}"
