@@ -65,7 +65,7 @@ rollback() {
         echo "→ Пользователь $NEW_USER и sudoers удалены" | tee -a "$ROLLBACK_LOG"
     fi
 
-    # UFW — откатываем ТОЛЬКО если он был выключен до скрипта
+    # UFW — откатываем ТОЛЬКО если был выключен до скрипта
     if $UFW_WAS_ENABLED; then
         ufw --force disable 2>/dev/null && \
             echo "→ UFW отключён (был выключен до запуска)" | tee -a "$ROLLBACK_LOG"
@@ -82,8 +82,8 @@ trap rollback INT ERR
 # ────────────────────────────────────────────────
 # Запрос имени пользователя
 # ────────────────────────────────────────────────
-echo -e "\n${YELLOW}Введите имя нового пользователя (a-z, 0-9, _, -)${NC}"
-read -r -p "Имя [admin]: " NEW_USER
+echo -e "\n${YELLOW}Введите имя нового пользователя (только a-z, 0-9, _, -)${NC}"
+read -r -p "Имя пользователя: " NEW_USER
 NEW_USER=${NEW_USER:-admin}
 
 if [[ ! "$NEW_USER" =~ ^[a-zA-Z0-9_-]{3,32}$ ]]; then
@@ -103,7 +103,7 @@ fi
 # Запрос порта
 # ────────────────────────────────────────────────
 echo -e "\n${YELLOW}Новый порт SSH (рекомендуется >1024, не 22)${NC}"
-read -r -p "Порт [2222]: " NEW_PORT
+read -r -p "Новый порт SSH: " NEW_PORT
 NEW_PORT=${NEW_PORT:-2222}
 
 if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1024 ] || [ "$NEW_PORT" -gt 65535 ]; then
