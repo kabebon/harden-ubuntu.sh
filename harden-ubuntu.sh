@@ -174,8 +174,9 @@ systemctl restart fail2ban
 echo -e "${GREEN}fail2ban установлен и настроен на защиту порта $NEW_PORT${NC}"
 
 # Включение BBR (если доступен)
+# Включение BBR
 echo -e "\n${GREEN}Проверяем и включаем BBR...${NC}"
-if sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr; then
+if modprobe tcp_bbr 2>/dev/null; then
     if ! sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
@@ -184,8 +185,10 @@ if sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr; then
     else
         echo -e "${YELLOW}BBR уже включён${NC}"
     fi
+    # Автозагрузка модуля
+    echo "tcp_bbr" >> /etc/modules 2>/dev/null || true
 else
-    echo -e "${YELLOW}BBR недоступен в ядре (модуль отсутствует)${NC}"
+    echo -e "${YELLOW}BBR недоступен — модуль tcp_bbr не найден в ядре${NC}"
 fi
 
 # Финальное сообщение и проверка
