@@ -1,5 +1,5 @@
 #!/bin/bash
-# harden-ubuntu.sh — v3.5 (2026) — с fail2ban, BBR и открытием 80/443 в UFW
+# harden-ubuntu.sh — v3.6 (2026) — с fail2ban, BBR и открытием 80/443 в UFW
 
 set -euo pipefail
 
