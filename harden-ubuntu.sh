@@ -1,5 +1,5 @@
 #!/bin/bash
-# harden-ubuntu.sh — v3.4 (финальная версия с автоматическим закрытием старого порта)
+# harden-ubuntu.sh — v3.5 (2026) — с fail2ban, BBR и открытием 80/443 в UFW
 
 set -euo pipefail
 
@@ -142,15 +142,50 @@ systemctl mask ssh.socket 2>/dev/null || true
 systemctl unmask ssh.service 2>/dev/null || true
 systemctl enable ssh.service 2>/dev/null || true
 
-# Перезапуск sshd (текущая сессия сохранится)
+# Перезапуск sshd
 systemctl restart ssh
 
-# UFW — открываем новый порт
+# UFW — открываем новый SSH порт + 80 и 443
 if command -v ufw &>/dev/null; then
     ufw allow "$NEW_PORT"/tcp 2>/dev/null || true
+    ufw allow 80/tcp 2>/dev/null || true
+    ufw allow 443/tcp 2>/dev/null || true
     if ! ufw status | grep -q "Status: active"; then
         echo "y" | ufw enable
     fi
+    echo -e "${GREEN}UFW: открыт порты $NEW_PORT/tcp, 80/tcp, 443/tcp${NC}"
+fi
+
+# Установка и настройка fail2ban
+echo -e "\n${GREEN}Устанавливаем fail2ban...${NC}"
+apt update -qq && apt install -y fail2ban
+
+cat > /etc/fail2ban/jail.local <<EOT
+[sshd]
+enabled   = true
+port      = $NEW_PORT
+logpath   = %(sshd_log)s
+maxretry  = 5
+bantime   = 3600
+findtime  = 600
+EOT
+
+systemctl restart fail2ban
+echo -e "${GREEN}fail2ban установлен и настроен на защиту порта $NEW_PORT${NC}"
+
+# Включение BBR (если доступен)
+echo -e "\n${GREEN}Проверяем и включаем BBR...${NC}"
+if sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr; then
+    if ! sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p
+        echo -e "${GREEN}BBR включён (tcp_congestion_control = bbr)${NC}"
+    else
+        echo -e "${YELLOW}BBR уже включён${NC}"
+    fi
+else
+    echo -e "${YELLOW}BBR недоступен в ядре (модуль отсутствует)${NC}"
 fi
 
 # Финальное сообщение и проверка
@@ -186,7 +221,7 @@ if [[ "$close_old" =~ ^[Yy]$ ]]; then
     # Удаляем строку с Port $OLD_PORT
     sed -i "/^Port $OLD_PORT$/d" /etc/ssh/sshd_config
     
-    # Проверка конфига ещё раз
+    # Проверка конфига
     sshd -t || {
         echo -e "${RED}Ошибка после удаления старого порта — откат изменений${NC}"
         cp "$SSHD_BACKUP" /etc/ssh/sshd_config
@@ -194,10 +229,10 @@ if [[ "$close_old" =~ ^[Yy]$ ]]; then
         exit 1
     }
     
-    # Перезапуск ssh (новый порт уже должен работать)
+    # Перезапуск ssh
     systemctl restart ssh
     
-    # Удаляем старое правило в ufw, если ufw активен
+    # Удаляем старое правило в ufw
     if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
         ufw delete allow "$OLD_PORT"/tcp 2>/dev/null || true
     fi
@@ -210,5 +245,10 @@ fi
 
 rm -rf "$KEY_DIR"
 echo -e "\n${GREEN}Скрипт успешно завершён. Сессия сохранена.${NC}"
+echo -e "${YELLOW}Дополнительно:${NC}"
+echo " - fail2ban защищает порт $NEW_PORT"
+echo " - BBR включён (если поддерживается ядром)"
+echo " - UFW открыл порты $NEW_PORT, 80 и 443"
+
 trap - INT TERM
 exit 0
