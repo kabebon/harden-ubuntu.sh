@@ -1,9 +1,7 @@
 #!/bin/bash
+# harden-ubuntu.sh — v3.3 (2026) — упрощённая версия без проблем с высокими портами и socket
+# Работает в классическом режиме (sshd напрямую), socket отключён
 
-# =============================================================================
-# harden-ubuntu.sh — безопасная настройка БЕЗ разрыва сессии v3.2
-# Убрана строгая проверка порта, добавлен выбор режима (socket / classic)
-# =============================================================================
 set -euo pipefail
 
 # Цвета
@@ -13,39 +11,37 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # Проверка root
-[[ $EUID -ne 0 ]] && { echo -e "${RED}Запустите от root${NC}"; exit 1; }
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}Запустите от root${NC}"
+    exit 1
+fi
 
 # Защита от curl | bash
-[[ -t 0 ]] || { echo -e "${RED}Не запускайте через curl | bash — скачайте и запустите отдельно${NC}"; exit 1; }
+if ! test -t 0; then
+    echo -e "${RED}Не запускайте через curl | bash — скачайте и запустите отдельно${NC}"
+    exit 1
+fi
 
-# -----------------------------------------------------------------------------
-# Переменные
-# -----------------------------------------------------------------------------
+# Лог отката
 ROLLBACK_LOG="/root/harden-rollback-$(date +%Y%m%d-%H%M%S).log"
 SSHD_BACKUP=""
 USER_CREATED=false
 SUDOERS_FILE=""
 KEY_DIR=""
-USE_SOCKET=true
 
 OLD_PORT=$(ss -tulpn | grep -E 'ssh|sshd' | head -1 | grep -oP ':\K\d+' || echo "22")
-
 echo "Лог отката: $ROLLBACK_LOG" | tee "$ROLLBACK_LOG"
 echo "Текущий порт SSH: $OLD_PORT" | tee -a "$ROLLBACK_LOG"
 
-# -----------------------------------------------------------------------------
 # Функция отката
-# -----------------------------------------------------------------------------
 rollback() {
     echo -e "\n${RED}Откат...${NC}" | tee -a "$ROLLBACK_LOG"
-    [ -n "$SSHD_BACKUP" ] && [ -f "$SSHD_BACKUP" ] && cp "$SSHD_BACKUP" /etc/ssh/sshd_config
+    if [ -n "$SSHD_BACKUP" ] && [ -f "$SSHD_BACKUP" ]; then
+        cp "$SSHD_BACKUP" /etc/ssh/sshd_config
+    fi
     rm -rf /etc/systemd/system/ssh.socket.d 2>/dev/null
     systemctl daemon-reload 2>/dev/null
-    if $USE_SOCKET; then
-        systemctl restart ssh.socket 2>/dev/null || true
-    else
-        systemctl restart ssh 2>/dev/null || true
-    fi
+    systemctl restart ssh 2>/dev/null || true
     if $USER_CREATED && id "$NEW_USER" &>/dev/null; then
         deluser --remove-home "$NEW_USER" 2>/dev/null
         rm -f "$SUDOERS_FILE" 2>/dev/null
@@ -56,43 +52,34 @@ rollback() {
 }
 trap rollback INT TERM
 
-# -----------------------------------------------------------------------------
 # Ввод данных
-# -----------------------------------------------------------------------------
 echo -e "\n${YELLOW}Имя пользователя (a-z,0-9,_,-):${NC}"
-read -r -p "> " NEW_USER
+read -r NEW_USER
 NEW_USER=${NEW_USER:-kabeba}
 [[ "$NEW_USER" =~ ^[a-zA-Z0-9_-]{3,32}$ ]] || { echo -e "${RED}Недопустимое имя${NC}"; exit 1; }
 
 if id "$NEW_USER" &>/dev/null; then
     echo -e "${YELLOW}Пользователь $NEW_USER существует. Продолжить? [y/N]${NC}"
-    read -r cont; [[ "$cont" =~ ^[Yy]$ ]] || exit 0
-    USER_EXISTS=true
-else
-    USER_EXISTS=false
+    read -r cont
+    [[ "$cont" =~ ^[Yy]$ ]] || exit 0
 fi
 
-echo -e "\n${YELLOW}Новый порт SSH (1024-65535) [рекомендую 2222]:${NC}"
-read -r -p "> " NEW_PORT
+echo -e "\n${YELLOW}Новый порт SSH (рекомендую 2222, 2200, 8022, 10022):${NC}"
+read -r NEW_PORT
 NEW_PORT=${NEW_PORT:-2222}
 [[ "$NEW_PORT" =~ ^[0-9]+$ ]] && [ "$NEW_PORT" -ge 1024 ] && [ "$NEW_PORT" -le 65535 ] || {
-    echo -e "${RED}Неверный порт${NC}"; exit 1
+    echo -e "${RED}Неверный порт${NC}"
+    exit 1
 }
 
-# Простая проверка (только занят ли явно)
+# Простая проверка (только если явно занят)
 if ss -tuln | grep -q ":$NEW_PORT "; then
-    echo -e "${RED}Порт $NEW_PORT занят (виден в ss)${NC}"
-    echo "Подождите 2–3 минуты (TIME_WAIT) или выберите другой порт."
+    echo -e "${RED}Порт $NEW_PORT уже занят (по ss)${NC}"
+    echo "Попробуйте другой порт или подождите 2–3 минуты."
     exit 1
 fi
 
-echo -e "${YELLOW}Хотите использовать socket-активацию? (рекомендуется) [Y/n]${NC}"
-read -r socket_choice
-[[ "$socket_choice" =~ ^[Nn]$ ]] && USE_SOCKET=false
-
-# -----------------------------------------------------------------------------
 # Генерация ключей
-# -----------------------------------------------------------------------------
 echo -e "\n${GREEN}Генерируем ключи ed25519...${NC}"
 KEY_DIR="/root/temp-ssh-key-$(date +%s)"
 mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
@@ -100,22 +87,22 @@ ssh-keygen -t ed25519 -f "$KEY_DIR/id_ed25519" -N "" -C "$NEW_USER@$(hostname)-$
 PUB_KEY=$(cat "$KEY_DIR/id_ed25519.pub")
 PRIV_KEY=$(cat "$KEY_DIR/id_ed25519")
 
-echo -e "\n${YELLOW}═══ ПРИВАТНЫЙ КЛЮЧ (СКОПИРУЙТЕ СЕЙЧАС) ═══${NC}\n$PRIV_KEY\n"
-echo -e "${YELLOW}═══════════════════════════════════════════${NC}\n"
-echo -e "${GREEN}Публичный ключ:${NC}\n$PUB_KEY${NC}\n"
+echo -e "\n${YELLOW}═══ ПРИВАТНЫЙ КЛЮЧ (СКОПИРУЙТЕ СЕЙЧАС) ═══${NC}\n"
+echo "$PRIV_KEY"
+echo -e "\n${YELLOW}═══════════════════════════════════════════${NC}\n"
+echo -e "${GREEN}Публичный ключ:${NC}\n$PUB_KEY\n"
 
-echo -e "${RED}!!! СКОПИРУЙТЕ ПРИВАТНЫЙ КЛЮЧ СЕЙЧАС !!! После копирования введите 'yes'${NC}"
-read -r -p "Введите yes для продолжения: " confirm
+echo -e "${RED}!!! СКОПИРУЙТЕ ПРИВАТНЫЙ КЛЮЧ СЕЙЧАС И СОХРАНИТЕ ЕГО В БЕЗОПАСНОМ МЕСТЕ !!!${NC}"
+echo -e "${RED}После копирования введите 'yes' и нажмите Enter${NC}"
+read -r confirm
 [[ "$confirm" == "yes" ]] || { rm -rf "$KEY_DIR"; exit 1; }
 
-# -----------------------------------------------------------------------------
-# Применение изменений
-# -----------------------------------------------------------------------------
+# Бэкап конфига
 SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
 cp /etc/ssh/sshd_config "$SSHD_BACKUP"
 
-# Создание пользователя
-if ! $USER_EXISTS; then
+# Создание пользователя (если не существует)
+if ! id "$NEW_USER" &>/dev/null; then
     adduser --disabled-password --gecos "" "$NEW_USER"
     usermod -aG sudo "$NEW_USER"
     SUDOERS_FILE="/etc/sudoers.d/90-$NEW_USER"
@@ -124,11 +111,12 @@ if ! $USER_EXISTS; then
     USER_CREATED=true
 fi
 
-# Установка ключа
+# Установка публичного ключа
 mkdir -p "/home/$NEW_USER/.ssh"
 echo "$PUB_KEY" > "/home/$NEW_USER/.ssh/authorized_keys"
 chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.ssh"
-chmod 700 "/home/$NEW_USER/.ssh" && chmod 600 "/home/$NEW_USER/.ssh/authorized_keys"
+chmod 700 "/home/$NEW_USER/.ssh"
+chmod 600 "/home/$NEW_USER/.ssh/authorized_keys"
 
 # Настройка sshd_config
 if grep -q "^Port" /etc/ssh/sshd_config; then
@@ -145,96 +133,53 @@ if ! grep -q "^ListenAddress" /etc/ssh/sshd_config; then
     echo "ListenAddress ::" >> /etc/ssh/sshd_config
 fi
 
-sshd -t || { echo -e "${RED}Ошибка в sshd_config${NC}"; rollback; }
+# Проверка конфига
+sshd -t || { echo -e "${RED}Ошибка в конфигурации sshd${NC}"; rollback; }
 
-# -----------------------------------------------------------------------------
-# Настройка сокета или классического режима
-# -----------------------------------------------------------------------------
-if $USE_SOCKET && systemctl is-active ssh.socket >/dev/null 2>&1; then
-    echo -e "${YELLOW}Добавляем порт $NEW_PORT в socket-активацию...${NC}"
-    mkdir -p /etc/systemd/system/ssh.socket.d
-    cat > /etc/systemd/system/ssh.socket.d/override.conf <<EOT
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:$OLD_PORT
-ListenStream=0.0.0.0:$NEW_PORT
-EOT
+# Отключаем socket activation (если ещё активна)
+systemctl stop ssh.socket 2>/dev/null || true
+systemctl disable ssh.socket 2>/dev/null || true
+systemctl mask ssh.socket 2>/dev/null || true
+systemctl unmask ssh.service 2>/dev/null || true
+systemctl enable ssh.service 2>/dev/null || true
 
-    IPV6_DISABLED=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1)
-    if [[ "$IPV6_DISABLED" == "0" ]]; then
-        echo "ListenStream=[::]:$OLD_PORT" >> /etc/systemd/system/ssh.socket.d/override.conf
-        echo "ListenStream=[::]:$NEW_PORT" >> /etc/systemd/system/ssh.socket.d/override.conf
-    fi
-    echo "FreeBind=true" >> /etc/systemd/system/ssh.socket.d/override.conf
+# Перезапуск sshd (текущая сессия сохранится)
+systemctl restart ssh
 
-    systemctl daemon-reload
-    if ! systemctl try-reload-or-restart ssh.socket; then
-        echo -e "${RED}Не удалось обновить ssh.socket — откат${NC}"
-        rollback
-    fi
-else
-    echo -e "${YELLOW}Отключаем socket-активацию и переходим в классический режим${NC}"
-    systemctl stop ssh.socket 2>/dev/null || true
-    systemctl disable ssh.socket 2>/dev/null || true
-    systemctl mask ssh.socket 2>/dev/null || true
-    systemctl unmask ssh.service 2>/dev/null || true
-    systemctl enable --now ssh.service 2>/dev/null || true
-    systemctl restart ssh
-fi
-
-# -----------------------------------------------------------------------------
-# UFW
-# -----------------------------------------------------------------------------
-if command -v ufw >/dev/null; then
+# UFW — открываем новый порт
+if command -v ufw &>/dev/null; then
     ufw allow "$NEW_PORT"/tcp 2>/dev/null || true
-    [[ "$(ufw status | grep -c 'Status: active')" -eq 0 ]] && echo y | ufw enable
+    if ! ufw status | grep -q "Status: active"; then
+        echo "y" | ufw enable
+    fi
 fi
 
-# -----------------------------------------------------------------------------
-# Финал
-# -----------------------------------------------------------------------------
+# Финальное сообщение
 SERVER_IP=$(hostname -I | awk '{print $1}')
 echo -e "\n${GREEN}═══════════════════════════════════════════════════════════════${NC}"
 echo -e " 🎉 НАСТРОЙКА ЗАВЕРШЕНА 🎉"
 echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}\n"
 
-echo -e "${YELLOW}Текущая сессия НЕ ПРЕРЫВАЛАСЬ! Старый порт $OLD_PORT работает.${NC}"
-echo -e "${GREEN}Новый порт $NEW_PORT добавлен.${NC}"
+echo -e "${YELLOW}ТЕКУЩАЯ СЕССИЯ НЕ ПРЕРЫВАЛАСЬ! Старый порт $OLD_PORT всё ещё работает.${NC}"
+echo -e "${GREEN}Новый порт $NEW_PORT добавлен и SSH перезапущен.${NC}\n"
+
 echo -e "Пользователь: ${YELLOW}$NEW_USER${NC}"
-echo -e "Проверьте в НОВОМ окне терминала:"
-echo -e "  ssh -p $NEW_PORT $NEW_USER@$SERVER_IP\n"
+echo -e "Проверка в НОВОМ окне терминала (НЕ ЗАКРЫВАЙТЕ это!):"
+echo -e "  ${YELLOW}ssh -p $NEW_PORT $NEW_USER@$SERVER_IP${NC}\n"
 
-echo -e "${RED}ВАЖНО:${NC}"
-echo "1. Откройте новое окно → проверьте подключение по новому порту"
-echo "2. Если работает → можно закрыть старый порт (опция ниже)"
-echo "3. Если НЕ работает → Ctrl+C в этом окне → откат"
+echo -e "${RED}⚠️ ВАЖНО:${NC}"
+echo "1. Откройте новое окно терминала"
+echo "2. Подключитесь по новому порту"
+echo "3. Если успешно → можете закрыть старый порт 22:"
+echo "   - Удалите строку 'Port $OLD_PORT' из /etc/ssh/sshd_config"
+echo "   - systemctl restart ssh"
+echo "   - ufw delete allow $OLD_PORT/tcp"
+echo "4. Если не подключается → нажмите Ctrl+C здесь для отката"
 
-echo -e "\n${YELLOW}Ожидание... (Enter = всё ок, Ctrl+C = откат)${NC}"
+echo -e "\n${YELLOW}Нажмите Enter, если всё работает (или Ctrl+C для отката)${NC}"
 read -r
 
-# Опционально закрыть старый порт
-echo -e "\n${GREEN}Закрыть старый порт $OLD_PORT автоматически? [y/N]${NC}"
-read -r close_old
-if [[ "$close_old" =~ ^[Yy]$ ]]; then
-    sed -i "/Port $OLD_PORT/d" /etc/ssh/sshd_config
-    if $USE_SOCKET; then
-        cat > /etc/systemd/system/ssh.socket.d/override.conf <<EOT
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:$NEW_PORT
-EOT
-        [[ "$IPV6_DISABLED" == "0" ]] && echo "ListenStream=[::]:$NEW_PORT" >> /etc/systemd/system/ssh.socket.d/override.conf
-        echo "FreeBind=true" >> /etc/systemd/system/ssh.socket.d/override.conf
-        systemctl daemon-reload
-        systemctl try-reload-or-restart ssh.socket || systemctl restart ssh.socket
-    else
-        systemctl restart ssh
-    fi
-    ufw delete allow "$OLD_PORT"/tcp 2>/dev/null || true
-    echo -e "${GREEN}Старый порт закрыт${NC}"
-fi
-
 rm -rf "$KEY_DIR"
-echo -e "\n${GREEN}Скрипт завершён. Сессия сохранена.${NC}"
+echo -e "\n${GREEN}Скрипт успешно завершён. Сессия сохранена.${NC}"
 trap - INT TERM
 exit 0
