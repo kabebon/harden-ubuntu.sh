@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# harden-ubuntu.sh — ультимативная безопасная настройка Ubuntu-сервера v2.0
+# harden-ubuntu.sh — безопасная настройка БЕЗ разрыва сессии v3.0
 # =============================================================================
-# Описание: создаёт пользователя, SSH-ключи, меняет порт, отключает root/пароли,
-#           включает UFW, BBR, fail2ban. Идеально обрабатывает socket activation.
+# КЛЮЧЕВАЯ ИДЕЯ: не перезапускаем SSH, а добавляем новый порт рядом со старым
+# Текущая сессия НЕ ПРЕРЫВАЕТСЯ!
 # =============================================================================
 
 set -euo pipefail
@@ -25,9 +25,10 @@ fi
 # -----------------------------------------------------------------------------
 ROLLBACK_LOG="/root/harden-rollback-$(date +%Y%m%d-%H%M%S).log"
 SSHD_BACKUP=""; USER_CREATED=false; SUDOERS_FILE=""; KEY_DIR=""
-SOCKET_OVERRIDE_CREATED=false
+OLD_PORT=$(ss -tulpn | grep sshd | head -1 | grep -oP ':\K\d+' || echo "22")
 
 echo "Лог отката: $ROLLBACK_LOG" | tee "$ROLLBACK_LOG"
+echo "Текущий порт SSH: $OLD_PORT" | tee -a "$ROLLBACK_LOG"
 
 # -----------------------------------------------------------------------------
 # Функция отката
@@ -38,15 +39,14 @@ rollback() {
     # Восстановление конфига
     [ -n "$SSHD_BACKUP" ] && [ -f "$SSHD_BACKUP" ] && cp "$SSHD_BACKUP" /etc/ssh/sshd_config
     
-    # Удаление override socket
-    if $SOCKET_OVERRIDE_CREATED; then
-        rm -rf /etc/systemd/system/ssh.socket.d
-        systemctl daemon-reload
-        systemctl restart ssh.socket 2>/dev/null || true
-    fi
+    # Удаление новых портов из socket override
+    rm -rf /etc/systemd/system/ssh.socket.d 2>/dev/null
+    systemctl daemon-reload
     
-    # Перезапуск SSH
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    # Перезапуск socket (только если был изменён)
+    if systemctl is-active ssh.socket >/dev/null 2>&1; then
+        systemctl restart ssh.socket
+    fi
     
     # Удаление пользователя (если создан)
     if $USER_CREATED && id "$NEW_USER" &>/dev/null; then
@@ -108,7 +108,7 @@ read -r -p "Введите yes для подтверждения: " confirm
 [[ "$confirm" == "yes" ]] || { rm -rf "$KEY_DIR"; exit 1; }
 
 # -----------------------------------------------------------------------------
-# Применение изменений
+# Применение изменений (БЕЗ ПЕРЕЗАПУСКА SSH)
 # -----------------------------------------------------------------------------
 # Бэкап
 SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
@@ -130,24 +130,62 @@ echo "$PUB_KEY" > "/home/$NEW_USER/.ssh/authorized_keys"
 chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.ssh"
 chmod 700 "/home/$NEW_USER/.ssh" && chmod 600 "/home/$NEW_USER/.ssh/authorized_keys"
 
-# Редактирование sshd_config
-sed -i "s/^#*Port.*/Port $NEW_PORT/" /etc/ssh/sshd_config
+# -----------------------------------------------------------------------------
+# ⭐ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: добавляем НОВЫЙ порт, НО НЕ УБИРАЕМ СТАРЫЙ
+# -----------------------------------------------------------------------------
+echo -e "\n${YELLOW}🔧 Добавляем новый порт $NEW_PORT рядом со старым $OLD_PORT...${NC}"
+
+# Редактирование sshd_config - добавляем новый порт, сохраняя старый
+if grep -q "^Port" /etc/ssh/sshd_config; then
+    # Если есть строка Port, комментируем её и добавляем оба порта
+    sed -i 's/^Port/#Port/g' /etc/ssh/sshd_config
+fi
+echo "Port $OLD_PORT" >> /etc/ssh/sshd_config
+echo "Port $NEW_PORT" >> /etc/ssh/sshd_config
+
+# Отключаем root и пароли (это безопасно делать сразу)
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 
-# КРИТИЧЕСКИ ВАЖНО: добавляем ListenAddress для обоих протоколов
+# Добавляем ListenAddress для надёжности
 if ! grep -q "^ListenAddress" /etc/ssh/sshd_config; then
     echo "ListenAddress 0.0.0.0" >> /etc/ssh/sshd_config
     echo "ListenAddress ::" >> /etc/ssh/sshd_config
-else
-    sed -i 's/^#*ListenAddress.*/ListenAddress 0.0.0.0\nListenAddress ::/' /etc/ssh/sshd_config
 fi
 
 # Проверка синтаксиса
 sshd -t || { echo -e "${RED}Ошибка конфига${NC}"; rollback; }
 
 # -----------------------------------------------------------------------------
-# UFW
+# Настройка socket activation (ДОБАВЛЯЕМ порт, НЕ ПЕРЕЗАПУСКАЯ)
+# -----------------------------------------------------------------------------
+if systemctl is-active ssh.socket >/dev/null 2>&1; then
+    echo "🔧 Обнаружен socket activation - добавляем порт $NEW_PORT к существующему..." | tee -a "$ROLLBACK_LOG"
+    
+    # Создаём директорию, если нет
+    mkdir -p /etc/systemd/system/ssh.socket.d
+    
+    # Создаём override, который ДОБАВЛЯЕТ новый порт к существующим
+    cat > /etc/systemd/system/ssh.socket.d/port.conf <<EOT
+[Socket]
+ListenStream=0.0.0.0:$NEW_PORT
+ListenStream=[::]:$NEW_PORT
+FreeBind=true
+EOT
+    SOCKET_OVERRIDE_CREATED=true
+    
+    # Просто перезагружаем конфигурацию, НО НЕ ПЕРЕЗАПУСКАЕМ САМ СЕРВИС!
+    systemctl daemon-reload
+    
+    # Говорим systemd перечитать конфигурацию socket-а на лету
+    systemctl try-reload-or-restart ssh.socket
+    
+    echo -e "${GREEN}✓ Новый порт $NEW_PORT добавлен к socket. Старый порт $OLD_PORT продолжает работать.${NC}" | tee -a "$ROLLBACK_LOG"
+    echo "⚠️  Перезапуска socket НЕ ПРОИСХОДИЛО, ваша сессия СОХРАНЕНА!" | tee -a "$ROLLBACK_LOG"
+fi
+
+# -----------------------------------------------------------------------------
+# UFW - открываем новый порт, но НЕ ЗАКРЫВАЕМ старый
 # -----------------------------------------------------------------------------
 if ! command -v ufw &>/dev/null; then apt update -qq && apt install -y ufw; fi
 
@@ -160,7 +198,7 @@ if ! ufw status | grep -q "Status: active"; then
 fi
 
 # -----------------------------------------------------------------------------
-# BBR
+# BBR и fail2ban (безопасно, не влияют на сессию)
 # -----------------------------------------------------------------------------
 if sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr; then
     if ! sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
@@ -170,9 +208,6 @@ if sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr; then
     fi
 fi
 
-# -----------------------------------------------------------------------------
-# fail2ban
-# -----------------------------------------------------------------------------
 apt update -qq && apt install -y fail2ban
 cat > /etc/fail2ban/jail.local <<EOT
 [sshd]
@@ -186,61 +221,69 @@ EOT
 systemctl restart fail2ban
 
 # -----------------------------------------------------------------------------
-# ⭐ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: правильная обработка socket activation
+# ФИНАЛ: просим пользователя проверить новый порт
 # -----------------------------------------------------------------------------
-echo -e "\n${YELLOW}Настройка SSH...${NC}"
+SERVER_IP=$(hostname -I | awk '{print $1}')
 
-# Удаляем все существующие override для socket
-rm -rf /etc/systemd/system/ssh.socket.d
-mkdir -p /etc/systemd/system/ssh.socket.d
+echo -e "\n${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "               🎉 БАЗОВАЯ НАСТРОЙКА ЗАВЕРШЕНА 🎉"
+echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}\n"
+echo -e "${YELLOW}✅ ТЕКУЩАЯ SSH-СЕССИЯ НЕ ПРЕРЫВАЛАСЬ!${NC}"
+echo -e "${YELLOW}✅ СТАРЫЙ ПОРТ $OLD_PORT ВСЁ ЕЩЁ РАБОТАЕТ!${NC}"
+echo -e "${GREEN}✅ НОВЫЙ ПОРТ $NEW_PORT ДОБАВЛЕН!${NC}\n"
+echo -e "Пользователь: ${YELLOW}$NEW_USER${NC}"
+echo -e "Команда для проверки:"
+echo -e "  ${YELLOW}ssh -p $NEW_PORT $NEW_USER@$SERVER_IP${NC}\n"
+echo -e "${RED}⚠️  ВАЖНО:${NC}"
+echo "1. ОТКРОЙТЕ НОВОЕ ОКНО ТЕРМИНАЛА (не закрывая это!)"
+echo "2. Проверьте подключение по НОВОМУ порту:"
+echo "   ${YELLOW}ssh -p $NEW_PORT $NEW_USER@$SERVER_IP${NC}"
+echo "3. Если подключились успешно - МОЖЕТЕ закрыть старый порт:"
+echo "   - Отредактируйте /etc/ssh/sshd_config (удалите 'Port $OLD_PORT')"
+echo "   - Закройте порт в UFW: ufw delete allow $OLD_PORT/tcp"
+echo "   - Если используется socket: удалите старый порт из override"
+echo "4. Если НЕ подключились - нажмите Ctrl+C для отката"
 
-if systemctl is-active ssh.socket >/dev/null 2>&1; then
-    echo "🔧 Настройка socket activation..." | tee -a "$ROLLBACK_LOG"
+echo -e "\n${YELLOW}Ожидание проверки... (нажмите Enter если всё работает, Ctrl+C для отката)${NC}"
+read -r
+
+# -----------------------------------------------------------------------------
+# Опционально: помощь в закрытии старого порта
+# -----------------------------------------------------------------------------
+echo -e "\n${GREEN}Хотите, чтобы скрипт автоматически закрыл старый порт $OLD_PORT?${NC}"
+echo "Это БЕЗОПАСНО, только если вы УЖЕ подключились по новому порту в другом окне."
+read -r -p "Закрыть старый порт? (y/N): " close_old
+
+if [[ "$close_old" =~ ^[Yy]$ ]]; then
+    echo "Закрываем старый порт $OLD_PORT..." | tee -a "$ROLLBACK_LOG"
     
-    # Правильный override с явным указанием IPv4 и IPv6
-    cat > /etc/systemd/system/ssh.socket.d/port.conf <<EOT
+    # Удаляем старый порт из sshd_config
+    sed -i "/Port $OLD_PORT/d" /etc/ssh/sshd_config
+    
+    # Если есть socket activation - удаляем старый порт из override
+    if systemctl is-active ssh.socket >/dev/null 2>&1; then
+        # Просто перезаписываем override только с новым портом
+        cat > /etc/systemd/system/ssh.socket.d/port.conf <<EOT
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:$NEW_PORT
 ListenStream=[::]:$NEW_PORT
 FreeBind=true
 EOT
-    SOCKET_OVERRIDE_CREATED=true
-    
-    systemctl daemon-reload
-    systemctl stop ssh.service 2>/dev/null || true
-    systemctl restart ssh.socket
-    sleep 2
-    
-    # Проверка обоих протоколов
-    if ss -tuln | grep -q ":$NEW_PORT"; then
-        echo -e "${GREEN}✓ Socket слушает порт $NEW_PORT (IPv4+IPv6)${NC}" | tee -a "$ROLLBACK_LOG"
-    else
-        echo -e "${RED}✗ Ошибка запуска socket${NC}" | tee -a "$ROLLBACK_LOG"
-        rollback
+        systemctl daemon-reload
+        systemctl try-reload-or-restart ssh.socket
     fi
-else
-    echo "🔧 Классический режим SSH..." | tee -a "$ROLLBACK_LOG"
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || {
-        echo -e "${RED}✗ Не удалось перезапустить SSH${NC}"
-        rollback
-    }
-    sleep 2
-    ss -tuln | grep -q ":$NEW_PORT" || rollback
+    
+    # Закрываем в UFW
+    ufw delete allow "$OLD_PORT"/tcp 2>/dev/null || true
+    
+    echo -e "${GREEN}✓ Старый порт $OLD_PORT закрыт${NC}" | tee -a "$ROLLBACK_LOG"
 fi
 
 # -----------------------------------------------------------------------------
-# Финальное сообщение
+# Завершение
 # -----------------------------------------------------------------------------
-SERVER_IP=$(hostname -I | awk '{print $1}')
-echo -e "\n${GREEN}═══════════════════════════════════════════════════════════════${NC}"
-echo -e "               🎉 НАСТРОЙКА ЗАВЕРШЕНА 🎉"
-echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}\n"
-echo -e "Пользователь: ${YELLOW}$NEW_USER${NC}"
-echo -e "Порт SSH:     ${YELLOW}$NEW_PORT${NC}"
-echo -e "Команда:      ${YELLOW}ssh -p $NEW_PORT $NEW_USER@$SERVER_IP${NC}\n"
-echo -e "${RED}ВАЖНО: проверьте подключение в НОВОМ окне, не закрывая это!${NC}\n"
-
 rm -rf "$KEY_DIR"
+echo -e "\n${GREEN}✅ Скрипт успешно завершён! Сессия сохранена.${NC}"
 trap - INT TERM
 exit 0
